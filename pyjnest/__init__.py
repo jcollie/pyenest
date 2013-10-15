@@ -1,8 +1,10 @@
 # -*- mode: python; coding: utf-8 -*-
 
 import json
-import requests
 import logging
+import time
+
+import requests
 
 logger = logging.getLogger('pyenest')
 
@@ -10,7 +12,8 @@ class Connection(object):
     def __init__(self, username, password):
         self.username = username
         self.password = password
-        self.headers = {'User-Agent': 'Nest/1.1.0.10 CFNetwork/548.0.4'}
+        self.headers = {'User-Agent': 'Nest/1.1.0.10 CFNetwork/548.0.4',
+                        'Accept-Language': 'en-us'}
 
         # all the users ever seen on this connection
         self._users = {}
@@ -74,16 +77,24 @@ class User(object):
     def __init__(self, connection, user_id):
         self.connection = connection
         self.user_id = user_id
+
+        if self.user_id in self.connection._users:
+            raise RuntimeError
+
         self.connection._users[self.user_id] = self
 
     def __getattr__(self, name):
         if name.startswith('_'):
             name = '$' + name[1:]
-        data = self.connection.status['user'][self.user_id]
-        if name in data:
-            return data[name]
+
+        if name in self.user:
+            return self.user[name]
     
         raise AttributeError
+
+    @property
+    def user(self):
+        return self.connection.status['user'][self.user_id]
 
     @property
     def settings(self):
@@ -103,16 +114,24 @@ class UserSettings(object):
     def __init__(self, connection, user_id):
         self.connection = connection
         self.user_id = user_id
+
+        if self.user_id in self.connection._user_settings:
+            raise RuntimeError
+
         self.connection._user_settings[self.user_id] = self
 
     def __getattr__(self, name):
         if name.startswith('_'):
             name = '$' + name[1:]
-        data = self.connection.status['user_settings'][self.user_id]
-        if name in data:
-            return data[name]
+
+        if name in self.user_settings:
+            return self.user_settings[name]
     
         raise AttributeError
+
+    @property
+    def user_settings(self):
+        return self.connection.status['user_settings'][self.user_id]
 
     @property
     def user(self):
@@ -120,27 +139,45 @@ class UserSettings(object):
 
 class Device(object):
     @classmethod
+    def clean_id(klass, device_id):
+        if device_id.startswith('device.'):
+            return device_id[7:]
+
+        return device_id
+
+    @classmethod
     def get(klass, connection, device_id):
+        device_id = klass.clean_id(device_id)
+
         if device_id in connection._devices:
             return connection._devices[device_id]
+
         return klass(connection, device_id)
         
     def __init__(self, connection, device_id):
         self.connection = connection
-        self.device_id = device_id
+        self.device_id = self.clean_id(device_id)
+
+        if self.device_id in self.connection._devices:
+            raise RuntimeError
+
+        if self.device_id not in self.connection.status['device']:
+            raise RuntimeError
+
+        if self.device_id not in self.connection.status['shared']:
+            raise RuntimeError
+
         self.connection._devices[self.device_id] = self
 
     def __getattr__(self, name):
         if name.startswith('_'):
             name = '$' + name[1:]
 
-        data = self.connection.status['device'][self.device_id]
-        if name in data:
-            return data[name]
+        if name in self.device:
+            return self.device[name]
 
-        shared = self.connection.status['shared'][self.device_id]
-        if name in shared:
-            return shared[name]
+        if name in self.shared:
+            return self.shared[name]
 
         raise AttributeError
 
@@ -150,13 +187,23 @@ class Device(object):
                              self.connection.status['link'][self.device_id]['structure'])
 
     @property
-    def data(self):
+    def device(self):
         return self.connection.status['device'][self.device_id]
 
-    def toggle_fan(self):
-        was_on = self.fan_mode == 'on'
+    @property
+    def shared(self):
+        return self.connection.status['shared'][self.device_id]
 
-        data = {'fan_mode': ('auto' if was_on else 'on')}
+    @property
+    def fan_mode(self):
+        return self.device['fan_mode']
+
+    @fan_mode.setter
+    def fan_mode(self, value):
+        if value not in ['auto', 'on']:
+            raise ValueError('fan mode must be "auto" or "on"')
+
+        data = {'fan_mode': value}
 
         headers = self.connection.headers.copy()
         headers['Content-Type'] = 'application/json'
@@ -165,31 +212,38 @@ class Device(object):
                           data = json.dumps(data),
                           headers = headers)
 
-        print r.status_code
-        print r.text
+        if r.status_code != 200:
+            raise RuntimeError('Could not set the fan mode: "{}"'.format(r.text))
 
-    def change_temperature(self, delta = 0, target_type = 'target_temperature'):
-        old_target = getattr(self, target_type)
-        new_target = old_target + delta
+    def toggle_fan_mode(self):
+        self.fan_mode = {'auto': 'on', 'on': 'auto'}[self.fan_mode]
 
+    @property
+    def target_temperature(self):
+        return self.shared['target_temperature']
+
+    @target_temperature.setter
+    def target_temperature(self, value):
         data = {'target_change_pending': True,
-                target_type: '{:0.1f}'.format(new_target)}
+                'target_temperature': value}
 
         headers = self.connection.headers.copy()
+        headers['X-nl-base-version'] = '{}'.format(self.shared['$version'])
         headers['Content-Type'] = 'application/json'
 
         r = requests.post(self.connection.transport_url + '/v2/put/shared.{}'.format(self.device_id),
                           data = json.dumps(data),
                           headers = headers)
 
-        print r.status_code
-        print r.text
+        if r.status_code != 200:
+            raise RuntimeError('Could not set the target temperature: "{}"'.format(r.text))
 
 class Structure(object):
     @classmethod
     def clean_id(klass, structure_id):
         if structure_id.startswith('structure.'):
             return structure_id[10:]
+
         return structure_id
 
     @classmethod
@@ -206,26 +260,57 @@ class Structure(object):
 
         self.connection = connection
         self.structure_id = structure_id
+
+        if self.structure_id not in self.connection.status['structure']:
+            raise RuntimeError
+
+        if self.structure_id in self.connection._structures:
+            raise RuntimeError
+        
         self.connection._structures[self.structure_id] = self
 
     def __repr__(self):
         return 'Structure(\'{}\')'.format(self.structure_id)
 
+    def __getattr__(self, name):
+        if name.startswith('_'):
+            name = '$' + name[1:]
+
+        if name in self.structure:
+            return self.structure[name]
+
+        raise AttributeError
+
+    @property
+    def structure(self):
+        return self.connection.status['structure'][self.structure_id]
+
     @property
     def devices(self):
-        return {device.device_id: device for device, structure in self.connection.links if self == structure}
+        return {Device.clean_id(device_id): Device.get(self.connection, device_id) for device_id in self.structure['devices']}
 
-    def toggle_away(self, structure_id):
-        was_away = self.simple_status.structures[structure_id].away
+    @property
+    def away(self):
+        return self.structure['away']
 
-        data = {'away': not was_away}
+    @away.setter
+    def away(self, value):
+        if not isinstance(value, bool):
+            raise ValueError('Away can only be set to True or False')
 
-        headers = self.headers.copy()
+        data = {'away': value}
+                'away_timestamp': int(time.time() * 1000),
+                'away_setter': 0}
+
+        headers = self.connection.headers.copy()
+        headers['X-nl-base-version'] = '{}'.format(self.structure['$version'])
         headers['Content-Type'] = 'application/json'
-
-        r = requests.post(self.transport_url + '/v1/put/structure.{}'.format(structure_id),
+        r = requests.post(self.connection.transport_url + '/v2/put/structure.{}'.format(self.structure_id),
                           data = data,
                           headers = headers)
-        
-        print r.status_code
-        print r.text
+
+        if r.status_code != 200:
+            raise RuntimeError('Could not set away: "{}"'.format(r.text))
+
+    def toggle_away(self):
+        self.away = not self.away
