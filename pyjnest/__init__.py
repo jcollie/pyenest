@@ -298,7 +298,7 @@ class Structure(object):
         if not isinstance(value, bool):
             raise ValueError('Away can only be set to True or False')
 
-        data = {'away': value}
+        data = {'away': value,
                 'away_timestamp': int(time.time() * 1000),
                 'away_setter': 0}
 
